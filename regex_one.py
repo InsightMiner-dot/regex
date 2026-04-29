@@ -5,107 +5,84 @@ import re
 import os
 import glob
 
+# --- CONFIGURATION: LIST ONLY THE COLUMNS YOU WANT TO KEEP ---
+# This ignores "noise" like 'Remarks', 'Total Weight', etc.
+WANTED_COLUMNS = [
+    "Part Number", 
+    "Base Material", 
+    "UOM", 
+    "Base Price", 
+    "Total Price"
+]
+
 def extract_header_data(pdf_path):
-    """Uses pdfplumber to extract the static top-level contract info via cropping."""
-    headers = {
-        "Contract Number": "Not Found",
-        "Issue Date": "Not Found",
-        "Seller": "Not Found",
-        "Buyer": "Not Found"
-    }
-    
+    headers = {"Contract Number": "Not Found", "Issue Date": "Not Found", "Seller": "Not Found", "Buyer": "Not Found"}
     with pdfplumber.open(pdf_path) as pdf:
         first_page = pdf.pages[0]
-        
-        # 1. Standard extraction for single-line items at the very top
         text_standard = first_page.extract_text()
-        if not text_standard:
-            return headers
+        if not text_standard: return headers
 
+        # Regex for single line fields
         date_match = re.search(r'Issue\s*Date[^:]*:\s*(\d{1,2}-[A-Za-z]{3}-\d{4})', text_standard, re.IGNORECASE)
-        if date_match:
-            headers["Issue Date"] = date_match.group(1)
+        if date_match: headers["Issue Date"] = date_match.group(1)
 
         contract_match = re.search(r'Contract\s*Number[^:]*:\s*([A-Za-z0-9\-]+)', text_standard, re.IGNORECASE)
-        if contract_match:
-            headers["Contract Number"] = contract_match.group(1).strip()
+        if contract_match: headers["Contract Number"] = contract_match.group(1).strip()
 
-        # 2. CROP THE PAGE FOR SELLER AND BUYER
-        # Bounding box coordinates: (x0, top, x1, bottom)
-        width = first_page.width
-        height = first_page.height
+        # Crop logic to separate Seller (Left) and Buyer (Right)
+        w, h = first_page.width, first_page.height
         
-        # Crop Top-Left Quadrant (Assuming Seller is on the left)
-        left_bbox = (0, 0, width * 0.5, height * 0.5)
-        left_side = first_page.crop(left_bbox)
+        # Left Side (Seller)
+        left_side = first_page.crop((0, 0, w * 0.5, h * 0.4))
         seller_text = left_side.extract_text()
-        
-        # Crop Top-Right Quadrant (Assuming Buyer is on the right)
-        right_bbox = (width * 0.5, 0, width, height * 0.5)
-        right_side = first_page.crop(right_bbox)
-        buyer_text = right_side.extract_text()
-
-        # 3. Clean Regex on the isolated text
         if seller_text:
-            # Look for "Seller Name:", capture everything until a blank line or end of text
-            seller_match = re.search(r'Seller\s*Name[^:]*:\s*(.*?)(?=\n\s*\n|$)', seller_text, re.IGNORECASE | re.DOTALL)
-            if seller_match:
-                # Replace newlines with commas for clean Excel formatting
-                seller = seller_match.group(1).strip().replace('\n', ', ')
-                headers["Seller"] = re.sub(r'\s{2,}', ' ', seller)
+            m = re.search(r'Seller\s*Name[^:]*:\s*(.*?)(?=\n\s*\n|$)', seller_text, re.IGNORECASE | re.DOTALL)
+            if m: headers["Seller"] = re.sub(r'\s{2,}', ' ', m.group(1).strip().replace('\n', ', '))
 
+        # Right Side (Buyer)
+        right_side = first_page.crop((w * 0.5, 0, w, h * 0.4))
+        buyer_text = right_side.extract_text()
         if buyer_text:
-            # Look for "Buyer Name:", capture everything until a blank line or end of text
-            buyer_match = re.search(r'Buyer\s*Name[^:]*:\s*(.*?)(?=\n\s*\n|$)', buyer_text, re.IGNORECASE | re.DOTALL)
-            if buyer_match:
-                buyer = buyer_match.group(1).strip().replace('\n', ', ')
-                headers["Buyer"] = re.sub(r'\s{2,}', ' ', buyer)
+            m = re.search(r'Buyer\s*Name[^:]*:\s*(.*?)(?=\n\s*\n|$)', buyer_text, re.IGNORECASE | re.DOTALL)
+            if m: headers["Buyer"] = re.sub(r'\s{2,}', ' ', m.group(1).strip().replace('\n', ', '))
 
     return headers
 
 def extract_full_contract_data(pdf_path):
-    """Combines header data and table line items."""
     filename = os.path.basename(pdf_path) 
-    
-    # 1. Get the static header data
     header_data = extract_header_data(pdf_path)
     
-    # 2. Extract tables using Camelot (powered by OpenCV)
-    tables = camelot.read_pdf(pdf_path, pages='all', flavor='lattice')
+    # Extract tables - 'stream' is often better if 'lattice' creates too many empty columns
+    tables = camelot.read_pdf(pdf_path, pages='all', flavor='stream')
     
-    if not tables:
-        # Fallback if lattice finds no hard lines
-        tables = camelot.read_pdf(pdf_path, pages='all', flavor='stream')
-        
-    if not tables:
-        print(f"   -> No tables found in {filename}")
-        return pd.DataFrame()
-
     all_table_data = []
-    
-    for i, table in enumerate(tables):
+    for table in tables:
         df = table.df
-        
-        # Clean up column headers
+        # Clean headers: remove newlines and extra spaces
         df.columns = df.iloc[0].str.replace('\n', ' ').str.strip()
         df = df[1:].reset_index(drop=True)
         
-        # Filter out empty rows
-        df = df.replace('', pd.NA).dropna(how='all')
+        # 1. IDENTIFY RELEVANT COLUMNS
+        # We find which of our 'WANTED_COLUMNS' actually exist in this PDF table
+        existing_wanted_cols = [c for c in df.columns if any(wanted.lower() in str(c).lower() for wanted in WANTED_COLUMNS)]
         
-        # Check if this table actually contains our line items
-        has_part_column = any('part' in str(col).lower() for col in df.columns)
-        
-        if has_part_column:
-            all_table_data.append(df)
+        # 2. FILTER THE DATAFRAME
+        if existing_wanted_cols:
+            df_filtered = df[existing_wanted_cols].copy()
+            
+            # Remove rows that are completely empty in the 'Part Number' column
+            # (Adjust 'Part Number' to the exact name found in your PDF if different)
+            part_col = next((c for c in df_filtered.columns if 'part' in c.lower()), None)
+            if part_col:
+                df_filtered = df_filtered[df_filtered[part_col].astype(str).str.strip() != '']
+                all_table_data.append(df_filtered)
 
     if not all_table_data:
         return pd.DataFrame()
 
-    # Combine all pages of tables into one dataframe
     line_items_df = pd.concat(all_table_data, ignore_index=True)
     
-    # 3. Merge Header Data into the Line Items table
+    # Insert Header Data
     line_items_df.insert(0, "file_name", filename)
     line_items_df.insert(1, "Contract Number", header_data["Contract Number"])
     line_items_df.insert(2, "Issue Date", header_data["Issue Date"])
@@ -114,45 +91,21 @@ def extract_full_contract_data(pdf_path):
 
     return line_items_df
 
-def process_folder_of_pdfs(folder_path):
-    """Iterates through a directory, extracts data from all PDFs, and returns a master table."""
-    all_dataframes = []
-    search_pattern = os.path.join(folder_path, "*.pdf")
-    pdf_files = glob.glob(search_pattern)
-    
-    if not pdf_files:
-        print(f"No PDFs found in the folder: {folder_path}")
-        return pd.DataFrame()
-        
-    print(f"Found {len(pdf_files)} PDFs. Starting extraction...\n")
-
-    for file_path in pdf_files:
-        print(f"Processing: {os.path.basename(file_path)}")
+def process_folder(folder_path):
+    all_dfs = []
+    for f in glob.glob(os.path.join(folder_path, "*.pdf")):
+        print(f"Processing: {os.path.basename(f)}")
         try:
-            df = extract_full_contract_data(file_path)
-            if not df.empty:
-                all_dataframes.append(df)
-            else:
-                print(f"   -> Could not extract structured line items from {os.path.basename(file_path)}")
-        except Exception as e:
-            print(f"   -> Error processing {os.path.basename(file_path)}: {e}")
-
-    if all_dataframes:
-        master_df = pd.concat(all_dataframes, ignore_index=True)
-        return master_df
-    else:
-        return pd.DataFrame()
-
-if __name__ == "__main__":
-    # Define the folder containing your PDFs
-    my_pdf_folder = './' 
+            df = extract_full_contract_data(f)
+            if not df.empty: all_dfs.append(df)
+        except Exception as e: print(f"Error in {f}: {e}")
     
-    # Run the extraction
-    final_master_table = process_folder_of_pdfs(my_pdf_folder)
-    
-    # Save the results to Excel
-    if not final_master_table.empty:
-        final_master_table.to_excel('extracted_contracts.xlsx', index=False)
-        print("\nExtraction complete! Saved to extracted_contracts.xlsx")
+    if all_dfs:
+        final_df = pd.concat(all_dfs, ignore_index=True)
+        final_df.to_excel("Clean_Extracted_Data.xlsx", index=False)
+        print("Done! Data saved to Clean_Extracted_Data.xlsx")
     else:
-        print("\nFailed to extract usable data.")
+        print("No data extracted.")
+
+# RUN
+process_folder('./')
