@@ -1,8 +1,15 @@
 import os
 import pandas as pd
 import streamlit as st
+from dotenv import load_dotenv
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
+
+# ==========================================
+# 0. Load Environment Variables
+# ==========================================
+# This reads your local .env file. override=True ensures it updates any existing vars.
+load_dotenv(override=True) 
 
 # ==========================================
 # 1. Page Configuration & UI Layout
@@ -43,7 +50,7 @@ def get_azure_client():
     key = os.getenv("DOCUMENT_INTELLIGENCE_KEY")
     
     if not endpoint or not key:
-        st.error("⚠️ Azure credentials not found. Please set DOCUMENT_INTELLIGENCE_ENDPOINT and DOCUMENT_INTELLIGENCE_KEY environment variables.")
+        st.error("⚠️ Azure credentials not found. Please ensure they are set in your .env file.")
         st.stop()
         
     return DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
@@ -66,10 +73,10 @@ def process_invoices(uploaded_files, client):
         
         status_text.text(f"Processing: {file_name} ({idx + 1}/{len(uploaded_files)})...")
         
-        # Call Azure AI
+        # Call Azure AI (Using the updated 'body' parameter for v1.0.0+)
         poller = client.begin_analyze_document(
             model_id="prebuilt-invoice", 
-            analyze_request=file_bytes,
+            body=file_bytes, 
             content_type="application/pdf"
         )
         result = poller.result()
@@ -170,15 +177,22 @@ def main():
                 if not final_df.empty:
                     st.success(f"Successfully extracted {len(final_df)} line items from {len(uploaded_files)} files.")
                     
-                    # Display the DataFrame
+                    # Function to color rows based on the 95% confidence threshold check
+                    def highlight_review_rows(row):
+                        if row.get('Requires_Manual_Review') == 'Yes':
+                            return ['background-color: #ffcccc'] * len(row)
+                        return [''] * len(row)
+
+                    # Apply the styling to the DataFrame
+                    styled_df = final_df.style.apply(highlight_review_rows, axis=1)
+                    
+                    # Display the styled DataFrame in Streamlit
                     st.dataframe(
-                        final_df, 
-                        use_container_width=True,
-                        # Visually highlight rows that failed the 95% confidence check
-                        style=lambda x: ['background-color: #ffcccc' if val == 'Yes' else '' for val in x['Requires_Manual_Review']] if 'Requires_Manual_Review' in x else []
+                        styled_df, 
+                        use_container_width=True
                     )
                     
-                    # Provide CSV download button
+                    # Provide CSV download button (Make sure to export final_df, not styled_df)
                     csv_data = final_df.to_csv(index=False).encode('utf-8')
                     st.download_button(
                         label="Download Data as CSV",
