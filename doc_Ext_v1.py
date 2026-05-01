@@ -3,12 +3,10 @@ import fitz  # PyMuPDF
 import base64
 import instructor
 import os
-import sqlite3
 import asyncio
 from openai import AsyncAzureOpenAI
 from pydantic import BaseModel, Field
-from typing import List, Optional, Tuple
-from datetime import datetime
+from typing import List, Optional
 from dotenv import load_dotenv
 import pandas as pd
 
@@ -21,7 +19,7 @@ AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
 # ==============================================================
-# 1. New Schema for PO & Contract Extraction
+# 1. Pydantic Schema (PO / Contract Specific)
 # ==============================================================
 
 class POLineItem(BaseModel):
@@ -39,15 +37,23 @@ class POData(BaseModel):
     contract_number: Optional[str] = Field(None, description="The master contract or PO reference number")
     issue_date: Optional[str] = Field(None, description="Date the document was issued")
     currency: Optional[str] = Field(None, description="3-letter currency code")
-    document_total: float = Field(description="The grand total listed on the document")
     line_items: List[POLineItem]
 
 class PODocument(BaseModel):
     documents: List[POData] = Field(description="List of POs or Contracts found in the file")
 
 # ==============================================================
-# 2. PDF Processing Helpers
+# 2. Async Helpers & Loop Management
 # ==============================================================
+
+def run_async_tasks(tasks):
+    """Safely handle event loops in Streamlit threads."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
 
 async def pdf_to_images(file_bytes, max_pages, dpi):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -65,11 +71,11 @@ async def extract_po_async(client, file_bytes, max_pages, dpi):
     
     sys_prompt = (
         "You are an expert supply chain analyst. Extract data from Purchase Orders and Contracts. "
-        "Pay close attention to Index Flags and Material Indexing prices. "
-        "Strictly group items by Contract Number."
+        "Focus on: Part Number, Base Material, Index Flags (Y/N), Index Names, and pricing. "
+        "Group items strictly by their Contract Number."
     )
 
-    content = [{"type": "text", "text": "Extract all PO and Contract line items."}]
+    content = [{"type": "text", "text": "Extract all PO and Contract line items from the provided images."}]
     for img in images:
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
 
@@ -81,20 +87,20 @@ async def extract_po_async(client, file_bytes, max_pages, dpi):
     return response, total_pages
 
 # ==============================================================
-# 3. Streamlit UI Logic
+# 3. App Interface
 # ==============================================================
 
-st.set_page_config(page_title="PO & Contract Intelligence", layout="wide")
+st.set_page_config(page_title="Contract Data Extractor", layout="wide")
 
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("⚙️ Configuration")
     max_p = st.number_input("Max Pages", 1, 100, 15)
     res_dpi = st.slider("Resolution (DPI)", 72, 400, 200)
-    batch_size = st.slider("Concurrency", 1, 10, 4)
+    batch_size = st.slider("Concurrency Limit", 1, 10, 4)
     st.divider()
-    uploaded_files = st.file_uploader("Upload PO/Contract PDFs", type="pdf", accept_multiple_files=True)
+    uploaded_files = st.file_uploader("Upload PDF Documents", type="pdf", accept_multiple_files=True)
 
-st.title("📑 PO & Contract Data Extraction")
+st.title("📑 PO & Contract Intelligence")
 
 if st.button("🚀 Start Extraction") and uploaded_files:
     client = instructor.from_openai(AsyncAzureOpenAI(
@@ -106,29 +112,26 @@ if st.button("🚀 Start Extraction") and uploaded_files:
     all_extracted_rows = []
     progress_bar = st.progress(0)
     
-    # Batch Processing
     for i in range(0, len(uploaded_files), batch_size):
         chunk = uploaded_files[i : i + batch_size]
         chunk_bytes = [f.read() for f in chunk]
         
-        # Async Execution
+        # Create async tasks
         tasks = [extract_po_async(client, b, max_p, res_dpi) for b in chunk_bytes]
-        batch_results = asyncio.run(asyncio.gather(*tasks, return_exceptions=True))
+        
+        # Execute using the safe loop helper
+        batch_results = run_async_tasks(tasks)
         
         for idx, result in enumerate(batch_results):
             filename = chunk[idx].name
             
             if isinstance(result, Exception):
-                st.error(f"Failed to process {filename}: {result}")
+                st.error(f"Error processing {filename}: {result}")
                 continue
             
-            doc_data, total_pages = result
+            doc_data, _ = result
             for doc in doc_data.documents:
                 for item in doc.line_items:
-                    # Logic: Check if (Qty * Final Value) matches reported Total Price
-                    calc_line_total = (item.quantity or 0) * (item.final_value or 0)
-                    variance = round(calc_line_total - (item.total_price or 0), 2)
-                    
                     all_extracted_rows.append({
                         "File Name": filename,
                         "Page Number": item.page_number,
@@ -141,19 +144,15 @@ if st.button("🚀 Start Extraction") and uploaded_files:
                         "Index Price": item.index_price,
                         "Quantity": item.quantity,
                         "Final Value": item.final_value,
-                        "Total Price": item.total_price,
-                        "Math Variance": variance
+                        "Total Price": item.total_price
                     })
         
         progress_bar.progress((i + len(chunk)) / len(uploaded_files))
 
     if all_extracted_rows:
         df = pd.DataFrame(all_extracted_rows)
-        st.subheader("✅ Extraction Results")
+        st.subheader("✅ Extracted Data")
         st.dataframe(df, use_container_width=True, hide_index=True)
         
-        # Download Option
         csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Results (CSV)", csv, "extracted_po_data.csv", "text/csv")
-    else:
-        st.warning("No data found in the uploaded documents.")
+        st.download_button("📥 Download CSV", csv, "contract_extraction.csv", "text/csv")
